@@ -30,6 +30,8 @@ EPOCHS = 100
 LR = 0.0005
 PATIENCE = 10
 
+OUTPUT_CSV = "Extracted_Features/speech_cnn_128_features.csv"
+
 print("Using device:", DEVICE)
 
 # ================= LABEL MAPPING =================
@@ -155,9 +157,7 @@ def print_dataset_stats(metadata):
 
 def train_and_test(metadata_df):
 
-    print("\n==============================")
-    print("Training model on COMBINED dataset")
-    print("==============================")
+    print("\nTraining model...")
 
     train_df = metadata_df[metadata_df["split"] == "train"]
     test_df = metadata_df[metadata_df["split"] == "test"]
@@ -165,21 +165,8 @@ def train_and_test(metadata_df):
     train_dataset = SpeechDataset(train_df,"Extracted_Features/Spectrograms/speech")
     test_dataset = SpeechDataset(test_df,"Extracted_Features/Spectrograms/speech")
 
-    g = torch.Generator()
-    g.manual_seed(SEED)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        generator=g
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False
-    )
+    train_loader = DataLoader(train_dataset,batch_size=BATCH_SIZE,shuffle=True)
+    test_loader = DataLoader(test_dataset,batch_size=BATCH_SIZE,shuffle=False)
 
     labels = train_dataset.df["label"].values
     binary_labels = [map_binary(l) for l in labels]
@@ -204,11 +191,6 @@ def train_and_test(metadata_df):
     criterion_stage2 = nn.CrossEntropyLoss(weight=weights_stage2)
 
     optimizer = torch.optim.Adam(model.parameters(),lr=LR)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer,step_size=20,gamma=0.5)
-
-    best_loss = float("inf")
-    patience_counter = 0
-    best_model_state = None
 
     # ================= TRAINING =================
 
@@ -218,12 +200,6 @@ def train_and_test(metadata_df):
 
         total_loss = 0
         total_samples = 0
-
-        correct_stage1 = 0
-        total_stage1 = 0
-
-        correct_stage2 = 0
-        total_stage2 = 0
 
         for x,y_bin,y_diag in train_loader:
 
@@ -251,96 +227,59 @@ def train_and_test(metadata_df):
             total_loss += loss.item()*x.size(0)
             total_samples += x.size(0)
 
-            preds1 = torch.argmax(out1,dim=1)
-
-            correct_stage1 += (preds1==y_bin).sum().item()
-            total_stage1 += y_bin.size(0)
-
-            if mask.sum()>0:
-
-                preds2 = torch.argmax(out2[mask],dim=1)
-
-                correct_stage2 += (preds2==y_diag[mask]).sum().item()
-                total_stage2 += mask.sum().item()
-
-        scheduler.step()
-
         avg_loss = total_loss / total_samples
 
-        acc_stage1 = correct_stage1 / total_stage1
-        acc_stage2 = correct_stage2 / total_stage2 if total_stage2>0 else 0
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {avg_loss:.4f}")
 
-        print(
-            f"Epoch {epoch+1}/{EPOCHS} | "
-            f"Loss: {avg_loss:.4f} | "
-            f"Stage1 Acc: {acc_stage1:.4f} | "
-            f"Stage2 Acc: {acc_stage2:.4f}"
-        )
+    # ================= FEATURE EXTRACTION =================
 
-        if avg_loss < best_loss:
+    print("\nExtracting CNN features...")
 
-            best_loss = avg_loss
-            patience_counter = 0
-            best_model_state = model.state_dict()
-
-        else:
-
-            patience_counter += 1
-            print(f"Patience counter: {patience_counter}/{PATIENCE}")
-
-            if patience_counter >= PATIENCE:
-                print("Early stopping triggered")
-                break
-
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-
-    # ================= FINAL TEST =================
+    full_dataset = SpeechDataset(metadata_df,"Extracted_Features/Spectrograms/speech")
+    full_loader = DataLoader(full_dataset,batch_size=BATCH_SIZE,shuffle=False)
 
     model.eval()
 
-    correct_stage1 = 0
-    total_stage1 = 0
-    correct_stage2 = 0
-    total_stage2 = 0
+    feature_rows = []
 
     with torch.no_grad():
 
-        for x,y_bin,y_diag in test_loader:
+        idx_counter = 0
+
+        for x,y_bin,y_diag in full_loader:
 
             x = x.to(DEVICE)
-            y_bin = y_bin.to(DEVICE)
-            y_diag = y_diag.to(DEVICE)
 
-            emb,out1,out2 = model(x)
+            emb,_,_ = model(x)
 
-            preds1 = torch.argmax(out1,dim=1)
+            emb = emb.cpu().numpy()
+            y_bin = y_bin.numpy()
+            y_diag = y_diag.numpy()
 
-            correct_stage1 += (preds1==y_bin).sum().item()
-            total_stage1 += y_bin.size(0)
+            for i in range(len(emb)):
 
-            mask = y_bin==1
+                row = {
+                    "sample_index": idx_counter,
+                    "stage1_label": int(y_bin[i]),
+                    "stage2_label": int(y_diag[i])
+                }
 
-            if mask.sum()>0:
+                for j in range(128):
+                    row[f"f{j}"] = emb[i][j]
 
-                preds2 = torch.argmax(out2[mask],dim=1)
+                feature_rows.append(row)
 
-                correct_stage2 += (preds2==y_diag[mask]).sum().item()
-                total_stage2 += mask.sum().item()
+                idx_counter += 1
 
-    print("\n===== FINAL TEST RESULTS =====")
+    df = pd.DataFrame(feature_rows)
+    df.to_csv(OUTPUT_CSV,index=False)
 
-    print(f"Stage-1 Accuracy: {100 * correct_stage1 / total_stage1:.2f}%")
-
-    if total_stage2>0:
-        print(f"Stage-2 Accuracy: {100 * correct_stage2 / total_stage2:.2f}%")
+    print("\nFeatures saved to:", OUTPUT_CSV)
 
 # ================= MAIN =================
 
 metadata = pd.read_csv("Final_5Class_Dataset/metadata.csv")
 
-# Print dataset stats
 print_dataset_stats(metadata)
 
-# Train single combined model
 train_and_test(metadata)
